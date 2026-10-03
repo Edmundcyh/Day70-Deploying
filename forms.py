@@ -1,6 +1,6 @@
 from flask_wtf import FlaskForm
 from wtforms import StringField, SubmitField, PasswordField
-from wtforms.validators import DataRequired, URL
+from wtforms.validators import DataRequired, URL, Length
 from flask_ckeditor import CKEditorField
 
 
@@ -27,5 +27,6 @@ class LoginForm(FlaskForm):
 
 
 class CommentForm(FlaskForm):
-    comment_text = CKEditorField("Comment", validators=[DataRequired()])
+    # The length cap keeps comment sanitizing fast; deeply nested HTML gets slow to clean.
+    comment_text = CKEditorField("Comment", validators=[DataRequired(), Length(max=10000)])
     submit = SubmitField("Submit Comment")

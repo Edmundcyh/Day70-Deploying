@@ -1,22 +1,69 @@
+import html
 import os
 
+import click
+import nh3
 from flask import Flask, render_template, redirect, url_for, flash, abort
 from flask_bootstrap import Bootstrap
 from flask_ckeditor import CKEditor
+from flask_wtf.csrf import CSRFProtect
+from markupsafe import Markup
 from datetime import date
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import relationship
-from flask_login import UserMixin, login_user, LoginManager, login_required, current_user, logout_user
+from flask_login import UserMixin, AnonymousUserMixin, login_user, LoginManager, login_required, current_user, logout_user
 from forms import LoginForm, RegisterForm, CreatePostForm, CommentForm
 from flask_gravatar import Gravatar
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY")
+if not app.config['SECRET_KEY']:
+    raise RuntimeError("The SECRET_KEY environment variable is not set.")
+# Only the account with this exact email can create, edit or delete posts. The register page
+# refuses this email, so create the account with `flask create-admin`.
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip() or None
+if ADMIN_EMAIL is None:
+    app.logger.warning("ADMIN_EMAIL is not set, so no account can create, edit or delete posts.")
+CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "").strip() or None
 ckeditor = CKEditor(app)
 Bootstrap(app)
-gravatar = Gravatar(app, size=100, rating='g', default='retro', force_default=False, force_lower=False, use_ssl=False, base_url=None)
+# Form tokens last as long as the session, so a form left open for over an hour still submits.
+app.config['WTF_CSRF_TIME_LIMIT'] = None
+csrf = CSRFProtect(app)
+gravatar = Gravatar(app, size=100, rating='g', default='retro', force_default=False, force_lower=False, use_ssl=True, base_url=None)
+
+##SANITIZE COMMENTS
+# Markup the comment editor (CKEditor 4 standard) produces, minus images, styles, classes and ids.
+# Everything else, including scripts and event handlers, is stripped.
+COMMENT_TAGS = {
+    "p", "br", "hr", "div", "address", "strong", "b", "em", "i", "u", "s", "strike", "sub", "sup",
+    "del", "ins", "q", "cite", "kbd", "samp", "var", "small", "big", "tt",
+    "blockquote", "pre", "code", "ul", "ol", "li", "a",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "caption", "thead", "tbody", "tr", "th", "td",
+}
+COMMENT_ATTRIBUTES = {
+    "a": {"href", "title"},
+    "table": {"border", "cellpadding", "cellspacing"},
+    "th": {"scope"},
+}
+
+
+def clean_comment_html(comment):
+    return nh3.clean(comment, tags=COMMENT_TAGS, attributes=COMMENT_ATTRIBUTES, url_schemes={"http", "https", "mailto"})
+
+
+def has_visible_text(comment):
+    # CKEditor wraps everything in <p>, so check the text a reader would see, not the markup.
+    return bool(html.unescape(nh3.clean(comment, tags=set())).strip())
+
+
+@app.template_filter("clean_comment")
+def clean_comment_filter(comment):
+    # Also applied when rendering, so comments saved before sanitizing was added are cleaned too.
+    return Markup(clean_comment_html(comment))
 
 ##CONNECT TO DB
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get("DATABASE_URL",  "sqlite:///blog.db")
@@ -24,6 +71,13 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
+
+
+class AnonymousUser(AnonymousUserMixin):
+    is_admin = False
+
+
+login_manager.anonymous_user = AnonymousUser
 
 
 @login_manager.user_loader
@@ -40,6 +94,10 @@ class User(UserMixin, db.Model):
     name = db.Column(db.String(100))
     posts = relationship("BlogPost", back_populates="author")
     comments = relationship("Comment", back_populates="comment_author")
+
+    @property
+    def is_admin(self):
+        return ADMIN_EMAIL is not None and self.email == ADMIN_EMAIL
 
 
 class BlogPost(db.Model):
@@ -69,7 +127,7 @@ db.create_all()
 def admin_only(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if current_user.id != 1:
+        if not current_user.is_admin:
             return abort(403)
         return f(*args, **kwargs)
     return decorated_function
@@ -81,10 +139,33 @@ def get_all_posts():
     return render_template("index.html", all_posts=posts, current_user=current_user)
 
 
+def hash_password(password):
+    return generate_password_hash(password, method='pbkdf2:sha256', salt_length=8)
+
+
+@app.cli.command("create-admin")
+@click.option("--name", prompt=True, help="Name shown on the admin's posts.")
+@click.password_option()
+def create_admin(name, password):
+    """Create the admin account for ADMIN_EMAIL."""
+    if ADMIN_EMAIL is None:
+        raise click.ClickException("Set the ADMIN_EMAIL environment variable first.")
+    if User.query.filter_by(email=ADMIN_EMAIL).first():
+        raise click.ClickException(f"An account for {ADMIN_EMAIL} already exists.")
+    db.session.add(User(email=ADMIN_EMAIL, name=name, password=hash_password(password)))
+    db.session.commit()
+    click.echo(f"Created the admin account for {ADMIN_EMAIL}.")
+
+
 @app.route('/register', methods=["GET", "POST"])
 def register():
     form = RegisterForm()
     if form.validate_on_submit():
+
+        if ADMIN_EMAIL is not None and form.email.data == ADMIN_EMAIL:
+            # Otherwise anyone who knows the admin email could register it before the owner does.
+            form.email.errors.append("That email can't be used to register.")
+            return render_template("register.html", form=form, current_user=current_user)
 
         if User.query.filter_by(email=form.email.data).first():
             print(User.query.filter_by(email=form.email.data).first())
@@ -92,15 +173,10 @@ def register():
             flash("You've already signed up with that email, log in instead!")
             return redirect(url_for('login'))
 
-        hash_and_salted_password = generate_password_hash(
-            form.password.data,
-            method='pbkdf2:sha256',
-            salt_length=8
-        )
         new_user = User(
             email=form.email.data,
             name=form.name.data,
-            password=hash_and_salted_password,
+            password=hash_password(form.password.data),
         )
         db.session.add(new_user)
         db.session.commit()
@@ -140,20 +216,24 @@ def logout():
 @app.route("/post/<int:post_id>", methods=["GET", "POST"])
 def show_post(post_id):
     form = CommentForm()
-    requested_post = BlogPost.query.get(post_id)
+    requested_post = BlogPost.query.get_or_404(post_id)
 
     if form.validate_on_submit():
         if not current_user.is_authenticated:
             flash("You need to login or register to comment.")
             return redirect(url_for("login"))
 
-        new_comment = Comment(
-            text=form.comment_text.data,
-            comment_author=current_user,
-            parent_post=requested_post
-        )
-        db.session.add(new_comment)
-        db.session.commit()
+        comment_text = clean_comment_html(form.comment_text.data)
+        if has_visible_text(comment_text):
+            new_comment = Comment(
+                text=comment_text,
+                comment_author=current_user,
+                parent_post=requested_post
+            )
+            db.session.add(new_comment)
+            db.session.commit()
+            return redirect(url_for("show_post", post_id=post_id))
+        form.comment_text.errors.append("Your comment needs some text. Images aren't allowed in comments.")
 
     return render_template("post.html", post=requested_post, form=form, current_user=current_user)
 
@@ -165,7 +245,7 @@ def about():
 
 @app.route("/contact")
 def contact():
-    return render_template("contact.html", current_user=current_user)
+    return render_template("contact.html", contact_email=CONTACT_EMAIL, current_user=current_user)
 
 
 @app.route("/new-post", methods=["GET", "POST"])
@@ -193,7 +273,7 @@ def add_new_post():
 @app.route("/edit-post/<int:post_id>", methods=["GET", "POST"])
 @admin_only
 def edit_post(post_id):
-    post = BlogPost.query.get(post_id)
+    post = BlogPost.query.get_or_404(post_id)
     edit_form = CreatePostForm(
         title=post.title,
         subtitle=post.subtitle,
@@ -212,10 +292,10 @@ def edit_post(post_id):
     return render_template("make-post.html", form=edit_form, is_edit=True, current_user=current_user)
 
 
-@app.route("/delete/<int:post_id>")
+@app.route("/delete/<int:post_id>", methods=["POST"])
 @admin_only
 def delete_post(post_id):
-    post_to_delete = BlogPost.query.get(post_id)
+    post_to_delete = BlogPost.query.get_or_404(post_id)
     db.session.delete(post_to_delete)
     db.session.commit()
     return redirect(url_for('get_all_posts'))
