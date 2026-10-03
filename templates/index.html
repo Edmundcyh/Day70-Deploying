@@ -32,16 +32,21 @@
           <p class="post-meta">Posted by
             {{post.author.name}}
             on {{post.date}}
-            {% if current_user.id == 1: %}
-            <a href="{{url_for('delete_post', post_id=post.id) }}">✘</a>
+            {% if current_user.is_admin %}
+            <button type="submit" form="delete-post-{{ post.id }}" title="Delete post" style="background: none; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer;">✘</button>
             {% endif %}
           </p>
+          {% if current_user.is_admin %}
+          <form id="delete-post-{{ post.id }}" action="{{ url_for('delete_post', post_id=post.id) }}" method="post" onsubmit="return confirm('Delete this post?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          </form>
+          {% endif %}
         </div>
         {% endfor %}
 
 
         <!-- New Post -->
-        {% if current_user.id == 1: %}
+        {% if current_user.is_admin %}
         <div class="clearfix">
           <a class="btn btn-primary float-right" href="{{url_for('add_new_post')}}">Create New Post</a>
         </div>
