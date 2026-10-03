@@ -24,6 +24,17 @@ def register(client, user):
     return client.post("/register", data=user)
 
 
+def create_admin(app, password=ADMIN["password"]):
+    return app.test_cli_runner().invoke(
+        args=["create-admin", "--name", ADMIN["name"]], input=f"{password}\n{password}\n"
+    )
+
+
+def log_in_as_admin(app, client):
+    assert create_admin(app).exit_code == 0
+    client.post("/login", data={"email": ADMIN["email"], "password": ADMIN["password"]})
+
+
 def post_count():
     return main.BlogPost.query.count()
 
@@ -74,9 +85,39 @@ def test_first_registered_user_is_not_admin(client):
     assert client.get("/new-post").status_code == 403
 
 
-def test_user_with_admin_email_is_admin(client):
-    register(client, ADMIN)
+def test_create_admin_command_creates_the_admin(app, client):
+    result = create_admin(app)
+    assert result.exit_code == 0
+    assert "Created the admin account for admin@example.com." in result.output
+    admin = main.User.query.filter_by(email=ADMIN["email"]).one()
+    assert admin.name == ADMIN["name"]
+    assert admin.password.startswith("pbkdf2:sha256:")
+    client.post("/login", data={"email": ADMIN["email"], "password": ADMIN["password"]})
     assert client.get("/new-post").status_code == 200
+
+
+def test_register_page_refuses_the_admin_email(client):
+    response = register(client, ADMIN)
+    assert response.status_code == 200
+    assert "That email can&#39;t be used to register." in response.get_data(as_text=True)
+    assert main.User.query.count() == 0
+    assert client.get("/new-post").status_code == 403
+
+
+def test_create_admin_command_refuses_existing_account(app):
+    assert create_admin(app).exit_code == 0
+    result = create_admin(app, password="another-password")
+    assert result.exit_code != 0
+    assert "already exists" in result.output
+    assert main.User.query.count() == 1
+
+
+def test_create_admin_command_needs_admin_email(app, monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_EMAIL", None)
+    result = create_admin(app)
+    assert result.exit_code != 0
+    assert "Set the ADMIN_EMAIL environment variable first." in result.output
+    assert main.User.query.count() == 0
 
 
 def test_admin_email_must_match_exactly(client):
@@ -101,8 +142,8 @@ def test_admin_controls_hidden_from_user_1_when_not_admin(client, make_post):
     assert f"/edit-post/{post_id}" not in client.get(f"/post/{post_id}").get_data(as_text=True)
 
 
-def test_admin_sees_admin_controls(client, post_id):
-    register(client, ADMIN)
+def test_admin_sees_admin_controls(app, client, post_id):
+    log_in_as_admin(app, client)
     home = client.get("/").get_data(as_text=True)
     assert "Create New Post" in home
     assert "Delete post" in home
@@ -115,29 +156,29 @@ def test_missing_post_returns_404(client):
     assert client.get("/post/999").status_code == 404
 
 
-def test_admin_gets_404_for_missing_post(client):
-    register(client, ADMIN)
+def test_admin_gets_404_for_missing_post(app, client):
+    log_in_as_admin(app, client)
     assert client.get("/edit-post/999").status_code == 404
     assert client.post("/delete/999").status_code == 404
 
 
 # --- Deleting posts ---
 
-def test_delete_does_not_accept_get(client, post_id):
-    register(client, ADMIN)
+def test_delete_does_not_accept_get(app, client, post_id):
+    log_in_as_admin(app, client)
     assert client.get(f"/delete/{post_id}").status_code == 405
     assert post_count() == 1
 
 
 def test_delete_without_csrf_token_is_rejected(app, client, post_id):
-    register(client, ADMIN)
+    log_in_as_admin(app, client)
     app.config["WTF_CSRF_ENABLED"] = True
     assert client.post(f"/delete/{post_id}").status_code == 400
     assert post_count() == 1
 
 
 def test_admin_can_delete_with_button_on_home_page(app, client, post_id):
-    register(client, ADMIN)
+    log_in_as_admin(app, client)
     app.config["WTF_CSRF_ENABLED"] = True
     page = client.get("/").get_data(as_text=True)
     assert f'<button type="submit" form="delete-post-{post_id}"' in page
@@ -149,7 +190,7 @@ def test_admin_can_delete_with_button_on_home_page(app, client, post_id):
 
 
 def test_form_left_open_for_hours_still_submits(app, client, post_id, monkeypatch):
-    register(client, ADMIN)
+    log_in_as_admin(app, client)
     app.config["WTF_CSRF_ENABLED"] = True
     token = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/").get_data(as_text=True)).group(1)
     opened_at = itsdangerous.timed.time.time()

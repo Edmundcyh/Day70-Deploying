@@ -1,6 +1,7 @@
 import html
 import os
 
+import click
 import nh3
 from flask import Flask, render_template, redirect, url_for, flash, abort
 from flask_bootstrap import Bootstrap
@@ -20,7 +21,8 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY")
 if not app.config['SECRET_KEY']:
     raise RuntimeError("The SECRET_KEY environment variable is not set.")
-# Only the account registered with this exact email can create, edit or delete posts.
+# Only the account with this exact email can create, edit or delete posts. The register page
+# refuses this email, so create the account with `flask create-admin`.
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip() or None
 if ADMIN_EMAIL is None:
     app.logger.warning("ADMIN_EMAIL is not set, so no account can create, edit or delete posts.")
@@ -137,10 +139,33 @@ def get_all_posts():
     return render_template("index.html", all_posts=posts, current_user=current_user)
 
 
+def hash_password(password):
+    return generate_password_hash(password, method='pbkdf2:sha256', salt_length=8)
+
+
+@app.cli.command("create-admin")
+@click.option("--name", prompt=True, help="Name shown on the admin's posts.")
+@click.password_option()
+def create_admin(name, password):
+    """Create the admin account for ADMIN_EMAIL."""
+    if ADMIN_EMAIL is None:
+        raise click.ClickException("Set the ADMIN_EMAIL environment variable first.")
+    if User.query.filter_by(email=ADMIN_EMAIL).first():
+        raise click.ClickException(f"An account for {ADMIN_EMAIL} already exists.")
+    db.session.add(User(email=ADMIN_EMAIL, name=name, password=hash_password(password)))
+    db.session.commit()
+    click.echo(f"Created the admin account for {ADMIN_EMAIL}.")
+
+
 @app.route('/register', methods=["GET", "POST"])
 def register():
     form = RegisterForm()
     if form.validate_on_submit():
+
+        if ADMIN_EMAIL is not None and form.email.data == ADMIN_EMAIL:
+            # Otherwise anyone who knows the admin email could register it before the owner does.
+            form.email.errors.append("That email can't be used to register.")
+            return render_template("register.html", form=form, current_user=current_user)
 
         if User.query.filter_by(email=form.email.data).first():
             print(User.query.filter_by(email=form.email.data).first())
@@ -148,15 +173,10 @@ def register():
             flash("You've already signed up with that email, log in instead!")
             return redirect(url_for('login'))
 
-        hash_and_salted_password = generate_password_hash(
-            form.password.data,
-            method='pbkdf2:sha256',
-            salt_length=8
-        )
         new_user = User(
             email=form.email.data,
             name=form.name.data,
-            password=hash_and_salted_password,
+            password=hash_password(form.password.data),
         )
         db.session.add(new_user)
         db.session.commit()
