@@ -12,6 +12,7 @@ from datetime import date
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import relationship
 from flask_login import UserMixin, AnonymousUserMixin, login_user, LoginManager, login_required, current_user, logout_user
 from forms import LoginForm, RegisterForm, CreatePostForm, CommentForm
@@ -110,7 +111,8 @@ class BlogPost(db.Model):
     date = db.Column(db.String(250), nullable=False)
     body = db.Column(db.Text, nullable=False)
     img_url = db.Column(db.String(250), nullable=False)
-    comments = relationship("Comment", back_populates="parent_post")
+    # Comments go with their post when it is deleted, and show oldest first.
+    comments = relationship("Comment", back_populates="parent_post", cascade="all, delete-orphan", order_by="Comment.id")
 
 
 class Comment(db.Model):
@@ -135,7 +137,7 @@ def admin_only(f):
 
 @app.route('/')
 def get_all_posts():
-    posts = BlogPost.query.all()
+    posts = BlogPost.query.order_by(BlogPost.id.desc()).all()
     return render_template("index.html", all_posts=posts, current_user=current_user)
 
 
@@ -150,6 +152,8 @@ def create_admin(name, password):
     """Create the admin account for ADMIN_EMAIL."""
     if ADMIN_EMAIL is None:
         raise click.ClickException("Set the ADMIN_EMAIL environment variable first.")
+    if len(name) > 100:  # The size of the name column; Postgres rejects anything longer.
+        raise click.ClickException("The name must be 100 characters or fewer.")
     if User.query.filter_by(email=ADMIN_EMAIL).first():
         raise click.ClickException(f"An account for {ADMIN_EMAIL} already exists.")
     db.session.add(User(email=ADMIN_EMAIL, name=name, password=hash_password(password)))
@@ -248,6 +252,25 @@ def contact():
     return render_template("contact.html", contact_email=CONTACT_EMAIL, current_user=current_user)
 
 
+def title_is_taken(title, post_id=None):
+    existing = BlogPost.query.filter_by(title=title).first()
+    return existing is not None and existing.id != post_id
+
+
+def commit_post(form, post_id=None):
+    # Titles are unique in the database, which catches a duplicate even when two requests save the
+    # same title at once. Turn that into a form error instead of a 500.
+    try:
+        db.session.commit()
+        return True
+    except IntegrityError:
+        db.session.rollback()
+        if not title_is_taken(form.title.data, post_id):
+            raise
+        form.title.errors.append("A post with that title already exists.")
+        return False
+
+
 @app.route("/new-post", methods=["GET", "POST"])
 @admin_only
 def add_new_post():
@@ -262,8 +285,8 @@ def add_new_post():
             date=date.today().strftime("%B %d, %Y")
         )
         db.session.add(new_post)
-        db.session.commit()
-        return redirect(url_for("get_all_posts"))
+        if commit_post(form):
+            return redirect(url_for("get_all_posts"))
 
     return render_template("make-post.html", form=form, current_user=current_user)
 
@@ -286,8 +309,8 @@ def edit_post(post_id):
         post.subtitle = edit_form.subtitle.data
         post.img_url = edit_form.img_url.data
         post.body = edit_form.body.data
-        db.session.commit()
-        return redirect(url_for("show_post", post_id=post.id))
+        if commit_post(edit_form, post_id=post.id):
+            return redirect(url_for("show_post", post_id=post.id))
 
     return render_template("make-post.html", form=edit_form, is_edit=True, current_user=current_user)
 
