@@ -5,6 +5,7 @@ import sys
 
 import itsdangerous.timed
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 import main
 
@@ -122,6 +123,13 @@ def test_create_admin_command_refuses_existing_account(app):
     assert main.User.query.count() == 1
 
 
+def test_create_admin_command_refuses_overlong_name(app):
+    result = app.test_cli_runner().invoke(args=["create-admin", "--name", "a" * 101], input="pw\npw\n")
+    assert result.exit_code != 0
+    assert "The name must be 100 characters or fewer." in result.output
+    assert main.User.query.count() == 0
+
+
 def test_create_admin_command_needs_admin_email(app, monkeypatch):
     monkeypatch.setattr(main, "ADMIN_EMAIL", None)
     result = create_admin(app)
@@ -175,6 +183,8 @@ def test_admin_gets_404_for_missing_post(app, client):
 # --- Creating and editing posts ---
 
 def test_duplicate_title_gets_a_form_error(app, client):
+    # Duplicates are caught by the database's unique constraint when saving, so this also covers two
+    # requests saving the same title at once: there is no check beforehand for them to slip past.
     log_in_as_admin(app, client)
     assert client.post("/new-post", data=POST).status_code == 302
     response = client.post("/new-post", data=POST)
@@ -190,6 +200,17 @@ def test_editing_to_an_existing_title_gets_a_form_error(app, client, post_id):
     assert response.status_code == 200
     assert "A post with that title already exists." in response.get_data(as_text=True)
     assert main.BlogPost.query.get(post_id).title == "First post"
+
+
+def test_unrelated_database_error_when_saving_a_post_is_not_hidden(app, client, monkeypatch):
+    log_in_as_admin(app, client)
+
+    def failing_commit():
+        raise IntegrityError("INSERT INTO blog_posts", {}, Exception("NOT NULL constraint failed"))
+
+    monkeypatch.setattr(main.db.session, "commit", failing_commit)
+    with pytest.raises(IntegrityError):
+        client.post("/new-post", data=POST)
 
 
 def test_editing_a_post_can_keep_its_own_title(app, client, post_id):

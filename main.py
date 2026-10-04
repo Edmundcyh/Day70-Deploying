@@ -12,6 +12,7 @@ from datetime import date
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import relationship
 from flask_login import UserMixin, AnonymousUserMixin, login_user, LoginManager, login_required, current_user, logout_user
 from forms import LoginForm, RegisterForm, CreatePostForm, CommentForm
@@ -151,6 +152,8 @@ def create_admin(name, password):
     """Create the admin account for ADMIN_EMAIL."""
     if ADMIN_EMAIL is None:
         raise click.ClickException("Set the ADMIN_EMAIL environment variable first.")
+    if len(name) > 100:  # The size of the name column; Postgres rejects anything longer.
+        raise click.ClickException("The name must be 100 characters or fewer.")
     if User.query.filter_by(email=ADMIN_EMAIL).first():
         raise click.ClickException(f"An account for {ADMIN_EMAIL} already exists.")
     db.session.add(User(email=ADMIN_EMAIL, name=name, password=hash_password(password)))
@@ -250,9 +253,22 @@ def contact():
 
 
 def title_is_taken(title, post_id=None):
-    # Titles are unique in the database; check first so the admin gets a form error, not a 500.
     existing = BlogPost.query.filter_by(title=title).first()
     return existing is not None and existing.id != post_id
+
+
+def commit_post(form, post_id=None):
+    # Titles are unique in the database, which catches a duplicate even when two requests save the
+    # same title at once. Turn that into a form error instead of a 500.
+    try:
+        db.session.commit()
+        return True
+    except IntegrityError:
+        db.session.rollback()
+        if not title_is_taken(form.title.data, post_id):
+            raise
+        form.title.errors.append("A post with that title already exists.")
+        return False
 
 
 @app.route("/new-post", methods=["GET", "POST"])
@@ -260,9 +276,6 @@ def title_is_taken(title, post_id=None):
 def add_new_post():
     form = CreatePostForm()
     if form.validate_on_submit():
-        if title_is_taken(form.title.data):
-            form.title.errors.append("A post with that title already exists.")
-            return render_template("make-post.html", form=form, current_user=current_user)
         new_post = BlogPost(
             title=form.title.data,
             subtitle=form.subtitle.data,
@@ -272,8 +285,8 @@ def add_new_post():
             date=date.today().strftime("%B %d, %Y")
         )
         db.session.add(new_post)
-        db.session.commit()
-        return redirect(url_for("get_all_posts"))
+        if commit_post(form):
+            return redirect(url_for("get_all_posts"))
 
     return render_template("make-post.html", form=form, current_user=current_user)
 
@@ -292,15 +305,12 @@ def edit_post(post_id):
         body=post.body
     )
     if edit_form.validate_on_submit():
-        if title_is_taken(edit_form.title.data, post_id=post.id):
-            edit_form.title.errors.append("A post with that title already exists.")
-            return render_template("make-post.html", form=edit_form, is_edit=True, current_user=current_user)
         post.title = edit_form.title.data
         post.subtitle = edit_form.subtitle.data
         post.img_url = edit_form.img_url.data
         post.body = edit_form.body.data
-        db.session.commit()
-        return redirect(url_for("show_post", post_id=post.id))
+        if commit_post(edit_form, post_id=post.id):
+            return redirect(url_for("show_post", post_id=post.id))
 
     return render_template("make-post.html", form=edit_form, is_edit=True, current_user=current_user)
 
