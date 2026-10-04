@@ -110,7 +110,8 @@ class BlogPost(db.Model):
     date = db.Column(db.String(250), nullable=False)
     body = db.Column(db.Text, nullable=False)
     img_url = db.Column(db.String(250), nullable=False)
-    comments = relationship("Comment", back_populates="parent_post")
+    # Comments go with their post when it is deleted, and show oldest first.
+    comments = relationship("Comment", back_populates="parent_post", cascade="all, delete-orphan", order_by="Comment.id")
 
 
 class Comment(db.Model):
@@ -135,7 +136,7 @@ def admin_only(f):
 
 @app.route('/')
 def get_all_posts():
-    posts = BlogPost.query.all()
+    posts = BlogPost.query.order_by(BlogPost.id.desc()).all()
     return render_template("index.html", all_posts=posts, current_user=current_user)
 
 
@@ -248,11 +249,20 @@ def contact():
     return render_template("contact.html", contact_email=CONTACT_EMAIL, current_user=current_user)
 
 
+def title_is_taken(title, post_id=None):
+    # Titles are unique in the database; check first so the admin gets a form error, not a 500.
+    existing = BlogPost.query.filter_by(title=title).first()
+    return existing is not None and existing.id != post_id
+
+
 @app.route("/new-post", methods=["GET", "POST"])
 @admin_only
 def add_new_post():
     form = CreatePostForm()
     if form.validate_on_submit():
+        if title_is_taken(form.title.data):
+            form.title.errors.append("A post with that title already exists.")
+            return render_template("make-post.html", form=form, current_user=current_user)
         new_post = BlogPost(
             title=form.title.data,
             subtitle=form.subtitle.data,
@@ -282,6 +292,9 @@ def edit_post(post_id):
         body=post.body
     )
     if edit_form.validate_on_submit():
+        if title_is_taken(edit_form.title.data, post_id=post.id):
+            edit_form.title.errors.append("A post with that title already exists.")
+            return render_template("make-post.html", form=edit_form, is_edit=True, current_user=current_user)
         post.title = edit_form.title.data
         post.subtitle = edit_form.subtitle.data
         post.img_url = edit_form.img_url.data

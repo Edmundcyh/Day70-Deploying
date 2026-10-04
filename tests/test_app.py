@@ -10,6 +10,7 @@ import main
 
 ADMIN = {"email": "admin@example.com", "password": "admin-password", "name": "Admin"}
 READER = {"email": "reader@example.com", "password": "reader-password", "name": "Reader"}
+POST = {"title": "A title", "subtitle": "Sub", "img_url": "https://example.com/image.jpg", "body": "<p>Body</p>"}
 
 UNSAFE_COMMENT = (
     "<p onclick=\"alert(1)\">Nice <strong>post</strong></p>"
@@ -104,6 +105,15 @@ def test_register_page_refuses_the_admin_email(client):
     assert client.get("/new-post").status_code == 403
 
 
+@pytest.mark.parametrize("field", ["email", "name"])
+def test_overlong_register_fields_are_rejected(client, field):
+    # The columns are 100 characters; Postgres would reject a longer value with a 500.
+    response = register(client, dict(READER, **{field: "a" * 101}))
+    assert response.status_code == 200
+    assert "Field cannot be longer than 100 characters." in response.get_data(as_text=True)
+    assert main.User.query.count() == 0
+
+
 def test_create_admin_command_refuses_existing_account(app):
     assert create_admin(app).exit_code == 0
     result = create_admin(app, password="another-password")
@@ -162,6 +172,51 @@ def test_admin_gets_404_for_missing_post(app, client):
     assert client.post("/delete/999").status_code == 404
 
 
+# --- Creating and editing posts ---
+
+def test_duplicate_title_gets_a_form_error(app, client):
+    log_in_as_admin(app, client)
+    assert client.post("/new-post", data=POST).status_code == 302
+    response = client.post("/new-post", data=POST)
+    assert response.status_code == 200
+    assert "A post with that title already exists." in response.get_data(as_text=True)
+    assert post_count() == 1
+
+
+def test_editing_to_an_existing_title_gets_a_form_error(app, client, post_id):
+    log_in_as_admin(app, client)
+    assert client.post("/new-post", data=POST).status_code == 302
+    response = client.post(f"/edit-post/{post_id}", data=POST)
+    assert response.status_code == 200
+    assert "A post with that title already exists." in response.get_data(as_text=True)
+    assert main.BlogPost.query.get(post_id).title == "First post"
+
+
+def test_editing_a_post_can_keep_its_own_title(app, client, post_id):
+    log_in_as_admin(app, client)
+    response = client.post(f"/edit-post/{post_id}", data=dict(POST, title="First post", subtitle="Changed"))
+    assert response.status_code == 302
+    assert main.BlogPost.query.get(post_id).subtitle == "Changed"
+
+
+@pytest.mark.parametrize("field", ["title", "subtitle", "img_url"])
+def test_overlong_post_fields_are_rejected(app, client, field):
+    # The columns are 250 characters; Postgres would reject a longer value with a 500.
+    log_in_as_admin(app, client)
+    value = "https://example.com/" + "a" * 250 if field == "img_url" else "a" * 251
+    response = client.post("/new-post", data=dict(POST, **{field: value}))
+    assert response.status_code == 200
+    assert "Field cannot be longer than 250 characters." in response.get_data(as_text=True)
+    assert post_count() == 0
+
+
+def test_home_page_shows_newest_post_first(app, client, post_id):
+    log_in_as_admin(app, client)
+    assert client.post("/new-post", data=dict(POST, title="Second post")).status_code == 302
+    home = client.get("/").get_data(as_text=True)
+    assert home.index("Second post") < home.index("First post")
+
+
 # --- Deleting posts ---
 
 def test_delete_does_not_accept_get(app, client, post_id):
@@ -197,6 +252,14 @@ def test_form_left_open_for_hours_still_submits(app, client, post_id, monkeypatc
     monkeypatch.setattr(itsdangerous.timed.time, "time", lambda: opened_at + 3 * 60 * 60)
     assert client.post(f"/delete/{post_id}", data={"csrf_token": token}).status_code == 302
     assert post_count() == 0
+
+
+def test_deleting_a_post_deletes_its_comments(app, client, post_id):
+    log_in_as_admin(app, client)
+    client.post(f"/post/{post_id}", data={"comment_text": "<p>Hi</p>"})
+    assert main.Comment.query.count() == 1
+    assert client.post(f"/delete/{post_id}").status_code == 302
+    assert main.Comment.query.count() == 0
 
 
 # --- Comments ---
@@ -269,6 +332,29 @@ def test_comment_avatars_use_https(client, post_id):
     page = client.get(f"/post/{post_id}").get_data(as_text=True)
     assert "https://secure.gravatar.com/avatar/" in page
     assert "http://www.gravatar.com" not in page
+
+
+def test_comments_show_in_posting_order(client, post_id):
+    register(client, READER)
+    for text in ("first", "second", "third"):
+        client.post(f"/post/{post_id}", data={"comment_text": f"<p>{text}</p>"})
+    page = client.get(f"/post/{post_id}").get_data(as_text=True)
+    assert page.index("<p>first</p>") < page.index("<p>second</p>") < page.index("<p>third</p>")
+
+
+def test_logged_out_visitor_sees_login_link_instead_of_comment_editor(client, post_id):
+    page = client.get(f"/post/{post_id}").get_data(as_text=True)
+    assert 'name="comment_text"' not in page
+    assert "ckeditor" not in page
+    assert "to leave a comment" in page
+    assert 'href="/login"' in page
+
+
+def test_logged_in_user_sees_comment_editor(client, post_id):
+    register(client, READER)
+    page = client.get(f"/post/{post_id}").get_data(as_text=True)
+    assert 'name="comment_text"' in page
+    assert "to leave a comment" not in page
 
 
 # --- Contact page ---
